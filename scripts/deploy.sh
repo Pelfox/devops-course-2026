@@ -77,7 +77,6 @@ fi
 # 5. Проверка HTTPS с проверкой сертификата (без -k).
 if ! curl --fail --silent --show-error \
     --cacert "$CA_CERT" \
-    --connect-timeout 5 --max-time 15 \
     --output /dev/null "$SITE_URL"; then
     error "Ресурс ${SITE_URL} недоступен или проверка TLS не пройдена"
 fi
