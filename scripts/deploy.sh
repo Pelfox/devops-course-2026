@@ -1,85 +1,84 @@
 #!/usr/bin/env bash
-# Доставка статического ресурса на devops-vm
-# Использование: scripts/deploy.sh [--dry-run]
-set -euo pipefail
+set -uo pipefail
 
-REMOTE="devops"             # Псевдоним из ~/.ssh/config
-REMOTE_DIR="/var/www/devops-site"
-SITE_URL="https://devops.local"
-CA_CERT="${HOME}/devops.crt"
+PASS=0
+FAIL=0
 
-error() {
-    printf 'Ошибка: %s\n' "$1" >&2
-    exit 1
+check() {
+    local desc="$1" expected="$2" actual="$3"
+    if [[ "$actual" == "$expected" ]]; then
+        echo " [OK]   $desc"
+        ((PASS+=1))
+    else
+        echo " [FAIL] $desc (ожидалось: '$expected', получено: '$actual')"
+        ((FAIL+=1))
+    fi
 }
 
-# 1. Разбор аргумента --dry-run
-DRY_RUN=false
-if (( $# > 1 )); then
-    error 'Использование: scripts/deploy.sh [--dry-run]'
-fi
-if (( $# == 1 )); then
-    [[ "$1" == "--dry-run" ]] || error 'Допустимый аргумент: --dry-run'
-    DRY_RUN=true
-fi
-
-# 2. Проверки: наличие главной страницы и чистота рабочего дерева Git
-REPO_ROOT="$(git rev-parse --show-toplevel)" \
-    || error 'Запускайте сценарий из репозитория Git'
-LOCAL_DIR="${REPO_ROOT}/site/"
-
-[[ -f "${LOCAL_DIR}index.html" ]] \
-    || error "Файл ${LOCAL_DIR}index.html отсутствует; доставка отменена"
-
-GIT_CHANGES="$(git -C "$REPO_ROOT" status --porcelain)" \
-    || error 'Не удалось проверить состояние репозитория'
-[[ -z "$GIT_CHANGES" ]] \
-    || error 'Есть незафиксированные изменения Git (включая индекс и новые файлы); доставка отменена'
-
-COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD)" \
-    || error 'Не удалось определить хеш коммита'
-
-RSYNC_CMD="${RSYNC_BIN:-rsync}"
-if [[ -z "${RSYNC_BIN:-}" ]] && command -v brew >/dev/null 2>&1; then
-    BREW_RSYNC_PREFIX="$(brew --prefix rsync 2>/dev/null || true)"
-    if [[ -n "$BREW_RSYNC_PREFIX" && -x "$BREW_RSYNC_PREFIX/bin/rsync" ]]; then
-        RSYNC_CMD="$BREW_RSYNC_PREFIX/bin/rsync"
+# Проверить два условия одновременно в рамках пункта 7.2(г):
+# отсутствие общедоступных для записи объектов и права 600 у TLS-ключа.
+check_web_permissions() {
+    local writable key_mode
+    if ! writable="$(sudo find /var/www/devops-site -perm -o+w -print -quit 2>/dev/null)"; then
+        echo "error"
+        return
     fi
-fi
-command -v "$RSYNC_CMD" >/dev/null 2>&1 \
-    || error 'Утилита rsync не найдена (macOS: brew install rsync)'
+    if ! key_mode="$(sudo stat -c '%a' /etc/ssl/private/devops.key 2>/dev/null)"; then
+        echo "error"
+        return
+    fi
+    if [[ -z "$writable" && "$key_mode" == "600" ]]; then
+        echo "ok"
+    else
+        echo "error"
+    fi
+}
 
-# Проверка сертификата требуется только для реальной доставки.
-if [[ "$DRY_RUN" == false ]]; then
-    [[ -r "$CA_CERT" ]] \
-        || error "Сертификат ${CA_CERT} отсутствует или не читается"
-fi
+echo "Аудит конфигурации: $(hostname -f), $(date '+%Y-%m-%d %H:%M')"
 
-# 3. Одно SSH-соединение через rsync, без запроса пароля.
-RSYNC_ARGS=(-avz --delete --chmod=D755,F644)
-if [[ "$DRY_RUN" == true ]]; then
-    RSYNC_ARGS+=(--dry-run)
-    echo 'Пробный запуск: изменения на сервере не выполняются.'
-fi
+echo "[1] Служба SSH"
+check "Вход от имени root запрещён" "no" \
+    "$(sudo sshd -T | awk '$1=="permitrootlogin" {print $2}')"
+check "Парольная аутентификация отключена" "no" \
+    "$(sudo sshd -T | awk '$1=="passwordauthentication" {print $2}')"
+check "Порт SSH отличается от 22" "yes" \
+    "$(sudo sshd -T | awk '$1=="port" {found=1; if ($2==22) bad=1} END {print (found && !bad) ? "yes" : "no"}')"
+check "MaxAuthTries равен 3" "3" \
+    "$(sudo sshd -T | awk '$1=="maxauthtries" {print $2}')"
 
-if ! "$RSYNC_CMD" "${RSYNC_ARGS[@]}" \
-    -e 'ssh -o BatchMode=yes -o ConnectTimeout=5' \
-    "$LOCAL_DIR" "${REMOTE}:${REMOTE_DIR}/"; then
-    error 'Синхронизация rsync не выполнена (на macOS установите GNU rsync: brew install rsync)'
-fi
+echo "[2] Межсетевой экран"
+check "Межсетевой экран активен" "active" \
+    "$(sudo env LC_ALL=C ufw status | awk '/^Status:/ {print $2}')"
+check "Политика входящего трафика — deny" "deny" \
+    "$(sudo env LC_ALL=C ufw status verbose | awk '/^Default:/ {print $2}')"
 
-# 4. В режиме --dry-run проверка доступности не выполняется.
-if [[ "$DRY_RUN" == true ]]; then
-    echo "План доставки коммита ${COMMIT} выведен успешно."
-    exit 0
-fi
+echo "[3] Учётные записи"
+awk -F: '$3>=1000 && $3<65534 {printf " %s (uid=%s)\n", $1, $3}' /etc/passwd
 
-# 5. Проверка HTTPS с проверкой сертификата (без -k).
-if ! curl --fail --silent --show-error \
-    --cacert "$CA_CERT" \
-    --output /dev/null "$SITE_URL"; then
-    error "Ресурс ${SITE_URL} недоступен или проверка TLS не пройдена"
-fi
+echo "[4] Веб-сервер"
+# 7.2(а): служба nginx активна.
+check "Служба nginx активна" "active" "$(systemctl is-active nginx 2>/dev/null)"
 
-echo "Доставка коммита ${COMMIT} выполнена успешно: ${SITE_URL}"
-exit 0
+# 7.2(б): синтаксическая проверка конфигурации nginx.
+if sudo nginx -t >/dev/null 2>&1; then
+    nginx_syntax="ok"
+else
+    nginx_syntax="error"
+fi
+check "Конфигурация nginx синтаксически корректна" "ok" "$nginx_syntax"
+
+# 7.2(в): сертификат действителен ещё не менее 30 дней (2 592 000 секунд).
+if openssl x509 -in /etc/ssl/certs/devops.crt -noout -checkend 2592000 >/dev/null 2>&1; then
+    cert_valid="ok"
+else
+    cert_valid="error"
+fi
+check "Сертификат действителен минимум 30 дней" "ok" "$cert_valid"
+
+# 7.2(г): права каталога и закрытого ключа.
+check "Нет общедоступных для записи объектов; TLS-ключ имеет права 600" "ok" \
+    "$(check_web_permissions)"
+
+echo "--------------------------------"
+echo "Пройдено: $PASS, не пройдено: $FAIL"
+[[ "$FAIL" -eq 0 ]] && exit 0 || exit 1
