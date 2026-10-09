@@ -230,3 +230,143 @@ sudo grep 'UFW BLOCK' /var/log/ufw.log | tail -5
 ```
 
 **Предупреждение:** не включайте UFW, пока не разрешён фактический порт службы SSH. Команда `sudo ufw allow ssh` обычно разрешает `22/tcp` согласно `/etc/services`, а не изменённый порт `2222/tcp`.
+
+
+## 8. Веб-сервер
+
+### 8.1. Установка и расположение файлов
+
+| Параметр                         | Значение                                                                   |
+| -------------------------------- | -------------------------------------------------------------------------- |
+| Веб-сервер                       | Nginx (`nginx`, устанавливается через `apt`)                               |
+| Служба systemd                   | `nginx.service`                                                            |
+| Основной файл конфигурации       | `/etc/nginx/nginx.conf`                                                    |
+| Файл конфигурации ресурса        | `/etc/nginx/sites-available/devops-site`                                   |
+| Активный ресурс                  | Ссылка `/etc/nginx/sites-enabled/devops-site` на файл из `sites-available` |
+| Стандартный ресурс               | Ссылка `/etc/nginx/sites-enabled/default` удалена                          |
+| Каталог ресурса                  | `/var/www/devops-site`                                                     |
+| Владелец каталога и файлов       | `devops:devops`                                                            |
+| Права каталогов                  | `755` (`drwxr-xr-x`)                                                       |
+| Права файлов                     | `644` (`-rw-r--r--`)                                                       |
+| Учётная запись рабочих процессов | `www-data` (чтение без права записи)                                       |
+| Домен                            | `devops.local`                                                             |
+| HTTP                             | `80/tcp`: постоянное перенаправление `301` на HTTPS                        |
+| HTTPS                            | `443/tcp`: TLS 1.2 и 1.3                                                   |
+| Журнал обращений                 | `/var/log/nginx/devops-site.access.log`                                    |
+| Журнал ошибок                    | `/var/log/nginx/devops-site.error.log`                                     |
+
+Установка и подготовка каталога (выполняется на виртуальной машине):
+
+```bash
+sudo apt update && sudo apt install -y nginx
+sudo mkdir -p /var/www/devops-site
+sudo chown -R devops:devops /var/www/devops-site
+sudo find /var/www/devops-site -type d -exec chmod 755 {} +
+sudo find /var/www/devops-site -type f -exec chmod 644 {} +
+```
+
+### 8.2. HTTPS-сертификат и закрытый ключ
+
+| Параметр                         | Значение                                              |
+| -------------------------------- | ----------------------------------------------------- |
+| Сертификат                       | `/etc/ssl/certs/devops.crt`                           |
+| Владелец и права сертификата     | `root:root`, `644`                                    |
+| Закрытый ключ                    | `/etc/ssl/private/devops.key`                         |
+| Владелец и права закрытого ключа | `root:root`, `600`                                    |
+| Тип сертификата                  | Самоподписанный, RSA 2048                             |
+| Имя сертификата                  | `CN=devops.local` и `subjectAltName=DNS:devops.local` |
+| Срок действия                    | **365 дней с момента выпуска**                        |
+| Протоколы                        | TLSv1.2, TLSv1.3                                      |
+
+Команда формирования сертификата:
+
+```bash
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/ssl/private/devops.key \
+  -out /etc/ssl/certs/devops.crt \
+  -subj "/CN=devops.local" \
+  -addext "subjectAltName=DNS:devops.local"
+sudo chown root:root /etc/ssl/private/devops.key /etc/ssl/certs/devops.crt
+sudo chmod 600 /etc/ssl/private/devops.key
+sudo chmod 644 /etc/ssl/certs/devops.crt
+```
+
+Приватный ключ нельзя переносить в репозиторий. На хостовую машину по доверенному SSH-каналу переносится только сертификат:
+
+```bash
+scp devops:/etc/ssl/certs/devops.crt ~/devops.crt
+curl --cacert ~/devops.crt -I https://devops.local
+```
+
+### 8.3. Конфигурация ресурса Nginx
+
+Содержимое `/etc/nginx/sites-available/devops-site`:
+
+```nginx
+# Перенаправление HTTP -> HTTPS
+server {
+    listen 80;
+    listen [::]:80;
+    server_name devops.local;
+    return 301 https://$host$request_uri;
+}
+
+# Раздача статического сайта по HTTPS
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name devops.local;
+
+    ssl_certificate     /etc/ssl/certs/devops.crt;
+    ssl_certificate_key /etc/ssl/private/devops.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    root /var/www/devops-site;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    error_page 404 /404.html;
+
+    access_log /var/log/nginx/devops-site.access.log;
+    error_log /var/log/nginx/devops-site.error.log;
+}
+```
+
+> Если IPv6 отключён, удалите строки `listen [::]:80;` и `listen [::]:443 ssl;` перед проверкой Nginx. Заголовок HSTS в этой учебной конфигурации не добавляется.
+
+Активация ресурса и применение конфигурации:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/devops-site /etc/nginx/sites-enabled/devops-site
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+### 8.4. Доставка и контроль
+
+Файлы статического сайта хранятся в каталоге `site/` репозитория и публикуются в `/var/www/devops-site/` через `scripts/deploy.sh`.
+
+Проверки с хостовой системы:
+
+```bash
+curl -I http://devops.local                 # 301 -> https://devops.local/
+curl --cacert ~/devops.crt -I https://devops.local   # 200 OK
+scripts/deploy.sh --dry-run
+scripts/deploy.sh
+```
+
+Проверки на виртуальной машине:
+
+```bash
+systemctl is-active nginx
+sudo nginx -t
+sudo ss -tlnp | grep nginx
+ls -la /var/www/devops-site/
+sudo stat -c '%U:%G %a %n' /etc/ssl/certs/devops.crt /etc/ssl/private/devops.key
+sudo find /var/www/devops-site -perm -o+w
+openssl x509 -in /etc/ssl/certs/devops.crt -noout -checkend 2592000
+scripts/audit.sh; echo $?
+```
