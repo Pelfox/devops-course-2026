@@ -370,3 +370,142 @@ sudo find /var/www/devops-site -perm -o+w
 openssl x509 -in /etc/ssl/certs/devops.crt -noout -checkend 2592000
 scripts/audit.sh; echo $?
 ```
+
+## 9. Контейнеризация
+
+### 9.1. Docker Engine и Docker Compose
+
+Контейнеры размещаются на виртуальной машине `devops-vm` с Ubuntu Server 24.04 LTS. Docker Engine устанавливается **из официального APT-репозитория Docker**, а не из пакета Ubuntu `docker.io` (практическая работа № 7, подраздел 3.1). Для установки используются пакеты `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, `docker-compose-plugin`. Служба `docker.service` запускается под управлением systemd.
+
+Для воспроизведения установки см. [официальную инструкцию для Ubuntu](https://docs.docker.com/engine/install/ubuntu/). После добавления официального репозитория используются команды:
+
+```bash
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+```
+
+Для запуска Docker без `sudo` учётная запись `devops` (у неё также есть право `sudo`) должна быть добавлена в группу `docker`. После изменения состава группы требуется новая SSH-сессия:
+
+```bash
+sudo usermod -aG docker devops
+getent group docker                         # проверить фактический список участников
+id devops                                   # проверить docker и sudo
+```
+
+**Важно:** членство в группе `docker` фактически даёт возможность получить права root через Docker. Добавлять туда пользователей без разрешённого административного доступа нельзя.
+
+### 9.2. Проект, приложение и конфиденциальные переменные
+
+Репозиторий исходного кода: [Pelfox/devops-course-2026](https://github.com/Pelfox/devops-course-2026). На хостовой системе контейнерные файлы находятся в `app/` (`Dockerfile`, `app.py`, `requirements.txt`, `.dockerignore`, `docker-compose.yml`, `.env.example`). На ВМ они размещены в **`/home/devops/app/`**; проект Compose запускается из этого каталога под пользователем `devops`:
+
+```bash
+# На хостовой системе, из корня репозитория:
+rsync -avz --delete --exclude=.env --dry-run app/ devops:app/
+rsync -avz --delete --exclude=.env app/ devops:app/
+
+# На ВМ:
+cd /home/devops/app
+docker compose up -d --build
+docker compose ps
+```
+
+Файл с паролем PostgreSQL — **`/home/devops/app/.env`** — создаётся только на ВМ, должен принадлежать `devops` и иметь права **`600`**. В репозитории хранится исключительно `.env.example` с заглушкой. `app/.dockerignore` и `.gitignore` исключают `.env` из контекста сборки и из Git; при передаче по `rsync` обязательно сохраняется `--exclude=.env`, иначе `--delete` удалит секрет на сервере.
+
+```bash
+# На ВМ, выполнять один раз при первоначальной настройке:
+cd /home/devops/app
+cp .env.example .env
+chmod 600 .env
+sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 16)/" .env
+stat -c '%U:%G %a %n' .env              # ожидается: devops:devops 600 .env
+
+# В корне репозитория на хостовой системе:
+git ls-files | grep -x 'app/.env'       # пустой вывод
+```
+
+Пароль из `.env` нельзя публиковать в отчёте, выводить на экран или копировать на хостовую систему. Приложение подключается к СУБД по `DB_HOST=db` через внутренний DNS сети Compose. Образ приложения — `devops-app:1.0`, запускаемый от непривилегированного пользователя `app`; образ PostgreSQL — `postgres:16-alpine`.
+
+### 9.3. Сеть, порты и постоянное хранилище
+
+Compose создаёт изолированную пользовательскую bridge-сеть **`app_backend`**, в которой работают сервисы `app` и `db`. Название `app` в префиксе сети и тома обусловлено запуском проекта из `/home/devops/app/` с именем проекта Compose по умолчанию.
+
+| Компонент      | Адрес и порт                                        | Доступность                                                                        |
+| -------------- | --------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| Nginx HTTP     | `0.0.0.0:80` (также `[::]:80`, если IPv6 включён)   | Внешний HTTP; перенаправление на HTTPS                                             |
+| Nginx HTTPS    | `0.0.0.0:443` (также `[::]:443`, если IPv6 включён) | Внешний HTTPS; статический сайт и `/app/`                                          |
+| Flask/Gunicorn | **`127.0.0.1:5000:5000`**                           | Только localhost ВМ; Nginx подключается к `127.0.0.1:5000`                         |
+| PostgreSQL     | `5432/tcp` внутри `app_backend`                     | **Не публикуется** на сетевых интерфейсах ВМ; доступен сервису `app` по имени `db` |
+
+В `app/docker-compose.yml` для приложения задано `ports: ["127.0.0.1:5000:5000"]`, для `db` раздел `ports` отсутствует. Изменять публикацию на `5000:5000` нельзя: это открывает контейнер на всех интерфейсах, в том числе в обход обычных ограничений UFW из-за правил Docker в `iptables`.
+
+Данные PostgreSQL находятся в именованном томе **`app_db_data`** (в Compose объявлен как `db_data`), подключённом к `/var/lib/postgresql/data` внутри контейнера. Команда `docker compose down` сохраняет том, а **`docker compose down -v` безвозвратно удаляет его содержимое**; для обычной остановки и обновления флаг `-v` не применяется. Том нужен для сохранения таблицы и счётчика посещений после пересоздания контейнеров.
+
+```bash
+cd /home/devops/app
+docker network ls
+docker volume ls
+# Имя и расположение тома (Mountpoint) проверяются на конкретной ВМ:
+docker volume inspect app_db_data
+docker compose exec app getent hosts db
+sudo ss -tlnp | grep -E ':(5000|5432)\b'  # только 127.0.0.1:5000; нет 5432
+```
+
+### 9.4. Публикация через обратный прокси Nginx
+
+Nginx установлен непосредственно на ВМ, а не в Docker. Его конфигурация — `/etc/nginx/sites-available/devops-site`, активирована символьной ссылкой `/etc/nginx/sites-enabled/devops-site`. HTTP `:80` перенаправляется кодом 301 на HTTPS `:443`; сертификат `/etc/ssl/certs/devops.crt` и ключ `/etc/ssl/private/devops.key`. **Существующий статический сайт** `/var/www/devops-site` остаётся доступным по `https://devops.local/`.
+
+В блоке `server` для HTTPS дополнительно расположен следующий фрагмент (полная конфигурация приведена в разделе 8.3):
+
+```nginx
+location /app/ {
+    proxy_pass http://127.0.0.1:5000/;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+Завершающий `/` после порта в `proxy_pass` означает замену префикса `/app/`: запрос `/app/health` направляется в контейнер как `/health`. При остановке `app` Nginx возвращает `502 Bad Gateway`, подробности — в `/var/log/nginx/devops-site.error.log`.
+
+```bash
+# На ВМ:
+sudo nginx -t && sudo systemctl reload nginx
+
+# На хостовой системе:
+curl --cacert ~/devops.crt https://devops.local/app/
+curl --cacert ~/devops.crt https://devops.local/app/health   # ok
+curl --cacert ~/devops.crt -I https://devops.local/       # 200 OK
+```
+
+### 9.5. Проверка и воспроизведение отрицательного результата аудита
+
+Раздел `[5] Контейнеризация` сценария `scripts/audit.sh` проверяет активность Docker, состояние `healthy` у `app-db-1`, отсутствие TCP-прослушивания портов `5000` и `5432` на адресах, отличных от `127.0.0.1`, и права `600` для `/home/devops/app/.env`. Скрипт использует функцию `check` и возвращает `0`, когда все проверки разделов аудита пройдены, либо `1`, если есть ошибки.
+
+```bash
+# На хосте из корня репозитория: доставить аудит на ВМ
+ssh devops 'mkdir -p ~/scripts'
+rsync -av scripts/audit.sh devops:scripts/audit.sh
+
+# На ВМ:
+chmod +x ~/scripts/audit.sh
+~/scripts/audit.sh; echo $?                 # 0, если все проверки выполнены
+```
+
+Для обязательной отрицательной проверки пункта 3.6 **временно** опубликовать порт Flask на всех интерфейсах, затем восстановить исходную конфигурацию (выполняется только на учебной ВМ):
+
+```bash
+cd /home/devops/app
+cp docker-compose.yml docker-compose.yml.audit-backup
+sed -i 's/127\.0\.0\.1:5000:5000/5000:5000/' docker-compose.yml
+docker compose up -d
+~/scripts/audit.sh; echo $?                  # ожидается 1: проверка портов [FAIL]
+
+mv docker-compose.yml.audit-backup docker-compose.yml
+docker compose up -d
+~/scripts/audit.sh; echo $?                  # ожидается 0: все проверки [OK]
+```
+
+После теста убедиться, что публикация снова ограничена `127.0.0.1:5000`, база данных осталась в состоянии `healthy`, а проект продолжает работать.
+

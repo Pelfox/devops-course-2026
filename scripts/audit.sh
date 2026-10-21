@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 set -uo pipefail
 
@@ -51,6 +50,27 @@ echo "[3] Учётные записи"
 awk -F: '$3>=1000 && $3<65534 {
     printf " %s (uid=%s)\n", $1, $3
 }' /etc/passwd
+
+echo "[5] Контейнеризация"
+
+check "Служба Docker активна" "active" \
+"$(systemctl is-active docker 2>/dev/null || true)"
+
+check "Контейнер PostgreSQL app-db-1 в состоянии healthy" "healthy" \
+"$(docker inspect -f '{{.State.Health.Status}}' app-db-1 2>/dev/null || true)"
+
+ports_status="error"
+if listeners="$(ss -tlnH 2>/dev/null)"; then
+    ports_status="$(awk '
+        $4 ~ /:(5000|5432)$/ &&
+        $4 !~ /^127[.]0[.]0[.]1:(5000|5432)$/ { forbidden=1 }
+        END { print forbidden ? "no" : "yes" }
+    ' <<< "$listeners")"
+fi
+check "Порты 5000 и 5432 прослушиваются только на 127.0.0.1" "yes" "$ports_status"
+
+check "Права файла /home/devops/app/.env равны 600" "600" \
+"$(stat -c '%a' /home/devops/app/.env 2>/dev/null || true)"
 
 echo "--------------------------------"
 echo "Пройдено: $PASS, не пройдено: $FAIL"
